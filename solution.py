@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 from multiprocessing import shared_memory
 from typing import TypeAlias
 
@@ -12,18 +13,6 @@ RingView: TypeAlias = tuple[memoryview, memoryview | None, int, bool]
 
 
 class SharedBuffer(shared_memory.SharedMemory):
-    """
-    Applicant template.
-
-    Replace every method body with your own implementation while preserving the
-    public API used by the official tests.
-
-    The intended contract is:
-    - one writer and one or more readers
-    - shared state visible across processes
-    - bounded storage with reusable space after readers advance
-    - reads and writes report how many bytes are actually available
-    """
 
     _NO_READER = -1
 
@@ -37,25 +26,43 @@ class SharedBuffer(shared_memory.SharedMemory):
         cache_align: bool = False,
         cache_size: int = 64,
     ):
-        """
-        Open or create the shared buffer.
+        if reader != self._NO_READER and not (0 <= reader < num_readers):
+            raise ValueError("reader index out of range")
+        if cache_align and (cache_size < 1 or (cache_size & (cache_size - 1)) != 0):
+            raise ValueError("cache_size must be a power of two")
 
-        Expected behavior:
-        - validate constructor arguments
-        - allocate or attach to shared memory
-        - initialize any shared metadata needed to track writer and reader state
-        - set up local views/fields used by the rest of the methods
+        slots_per_reader = 3
+        metadata_slots = 6
+        header_slots = metadata_slots + num_readers * slots_per_reader
+        header_bytes = header_slots * ctypes.sizeof(ctypes.c_int64)
 
-        Parameters:
-        - `name`: shared memory block name
-        - `create`: `True` for the creator/owner, `False` to attach to an existing block
-        - `size`: logical payload capacity in bytes
-        - `num_readers`: number of reader slots to support
-        - `reader`: reader index for this instance, or `_NO_READER` for the writer instance
-        - `cache_align` / `cache_size`: optional metadata-layout knobs; you may ignore
-          them internally as long as validation and behavior remain correct
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.__init__")
+        super().__init__(name=name, create=create, size=header_bytes + size)
+
+        if self.buf is None:
+            raise RuntimeError("shared memory buffer is unavailable")
+
+        self.header = (ctypes.c_int64 * header_slots).from_buffer(self.buf, 0)
+
+        self.buffer_size = size
+        self.num_readers = num_readers
+        self.reader = reader
+        self._slots_per_reader = slots_per_reader
+        self._metadata_slots = metadata_slots
+
+        self._payload = self.buf[header_bytes:]
+
+        if create:
+            self.header[0] = 0
+            self.header[1] = size
+            self.header[2] = num_readers
+            for i in range(num_readers):
+                slot = metadata_slots + i * slots_per_reader
+                self.header[slot] = 0
+                self.header[slot + 1] = 0
+                self.header[slot + 2] = 0
+
+        self._cached_max_writable = size
+
 
     def close(self) -> None:
         """
